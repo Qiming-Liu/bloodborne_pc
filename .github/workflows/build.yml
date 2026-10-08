@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream version this build is based on (matches its release tag, e.g. 0.4)'
+        required: true
+        default: '0.4'
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out bbport
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space for the Nix/AppImage build
+        # The AppImage bundles a full GTK4/libadwaita/Mesa/ffmpeg closure (hundreds of MB);
+        # the default runner image leaves little headroom for that on top of Nix's own store.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Compile (out/bb-probe, out/gpu/libbbgpu.so)
+        run: nix-shell shell.nix --run "bash build.sh"
+
+      - name: Fetch FSR 4 shader assets
+        # packaging/default.nix bundles fsr4_shaders/ unconditionally; it's gitignored and fetched
+        # separately (not part of this repository: built by Q2RTX from AMD's FidelityFX SDK source).
+        run: nix-shell shell.nix --run "bash tools/fetch_fsr4_assets.sh"
+
+      - name: Build the AppImage
+        # packaging/appimage.sh: nix bundle with the ralismark/nix-appimage bundler, same as a release.
+        run: nix-shell shell.nix --run "bash packaging/appimage.sh"
+
+      - name: Rename the AppImage
+        run: |
+          cd dist
+          stamp=$(date -u +%Y%m%d-%H%M%S)
+          new_name="Bloodborne-bbport-${{ github.event.inputs.version }}-zhcn-x86_64-${stamp}.AppImage"
+          mv Bloodborne-bbport-x86_64.AppImage "$new_name"
+          echo "APPIMAGE_PATH=dist/$new_name" >> "$GITHUB_ENV"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbport-appimage
+          path: ${{ env.APPIMAGE_PATH }}
+          if-no-files-found: error
+
+      - name: Publish the GitHub Release
+        # Translated release notes are checked in (not machine-translated at build time) so the
+        # release body is reviewable like any other change: docs/RELEASE_NOTES_<version>.zh-CN.md.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event.inputs.version }}-zhcn"
+          notes="docs/RELEASE_NOTES_${{ github.event.inputs.version }}.zh-CN.md"
+          if [[ ! -f "$notes" ]]; then
+            echo "No translated release notes at $notes; add it before publishing this version." >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" "$APPIMAGE_PATH" --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$tag" "$APPIMAGE_PATH" \
+              --repo "${{ github.repository }}" \
+              --title "Bloodborne bbport ${{ github.event.inputs.version }} (简体中文)" \
+              --notes-file "$notes"
+          fi
